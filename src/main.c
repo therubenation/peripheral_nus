@@ -11,36 +11,45 @@
 
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
 #define RX_BUF_SIZE             128
 #define CMD_TERMINATOR          '#'
-
-/*
- * Conservative BLE notification payload target.
- *
- * We intentionally keep every notification <= 20 bytes for now.
- * This avoids depending on MTU negotiation while the protocol is still being
- * developed and tested manually with nRF Connect.
- */
-#define TRACE_NOTIFY_MAX_BYTES  20
-
-/*
- * Delay between trace notifications.
- *
- * This avoids pushing multiple notifications back-to-back from inside the RX
- * callback. It also makes packet flow easier to observe in nRF Connect.
- */
 #define TRACE_SEND_DELAY_MS     30
 
 static char rx_buf[RX_BUF_SIZE];
 static size_t rx_len = 0;
 
-static const int16_t fake_trace[] = {
-	-12, -10, -9, -4, 3, 12, 30, 18, 5, -1,
-	-3, -8, -11, -6, 2, 9, 14, 8, 1, -2
+struct trace_point {
+	int16_t voltage_mv;
+	int16_t current_na;
+};
+
+/*
+ * Fake CV-like trace data.
+ *
+ * Protocol meaning:
+ * V = voltage in millivolts
+ * I = current in nanoamps
+ *
+ * Each point will be sent as one notification:
+ *
+ *   P<index>;V=<voltage_mV>;I=<current_nA>
+ */
+static const struct trace_point fake_trace[] = {
+	{ -800, -21 },
+	{ -770, -18 },
+	{ -740, -14 },
+	{ -710, -10 },
+	{ -680, -7  },
+	{ -650, -5  },
+	{ -620, -3  },
+	{ -590, -2  },
+	{ -560, -1  },
+	{ -530,  0  },
 };
 
 static size_t trace_index = 0;
@@ -75,73 +84,6 @@ static int send_text_notification(struct bt_conn *conn, const char *text)
 	return err;
 }
 
-/**
- * @brief Build one trace data notification line.
- *
- * The output format is:
- *
- *   T=<value>,<value>,...\n
- *
- * The function appends as many trace values as fit into TRACE_NOTIFY_MAX_BYTES.
- * It returns how many values were added to the line.
- *
- * Example output:
- *
- *   T=-12,-10,-9\n
- *
- * @param out         Output buffer.
- * @param out_size    Output buffer size including space for '\0'.
- * @param start_index Index of the first fake_trace value to include.
- *
- * @return Number of trace values encoded into this chunk.
- */
-static size_t build_trace_chunk(char *out, size_t out_size, size_t start_index)
-{
-	size_t pos = 0;
-	size_t values_added = 0;
-
-	if (out_size < TRACE_NOTIFY_MAX_BYTES + 1) {
-		return 0;
-	}
-
-	pos += snprintk(out + pos, out_size - pos, "T=");
-
-	for (size_t i = start_index; i < ARRAY_SIZE(fake_trace); i++) {
-		char value_buf[12];
-		int value_len;
-
-		value_len = snprintk(value_buf, sizeof(value_buf),
-				     "%s%d",
-				     values_added == 0 ? "" : ",",
-				     fake_trace[i]);
-
-		if (value_len < 0) {
-			return 0;
-		}
-
-		/*
-		 * +1 reserves space for the trailing '\n'.
-		 * The final '\0' is handled by the out buffer size.
-		 */
-		if ((pos + (size_t)value_len + 1) > TRACE_NOTIFY_MAX_BYTES) {
-			break;
-		}
-
-		memcpy(out + pos, value_buf, value_len);
-		pos += (size_t)value_len;
-		values_added++;
-	}
-
-	if (values_added == 0) {
-		return 0;
-	}
-
-	out[pos++] = '\n';
-	out[pos] = '\0';
-
-	return values_added;
-}
-
 static void finish_trace_transfer(void)
 {
 	if (trace_conn != NULL) {
@@ -157,22 +99,33 @@ static void finish_trace_transfer(void)
 }
 
 /**
- * @brief Send the trace response as several small NUS notifications.
+ * @brief Send the trace response as several NUS notifications.
  *
- * This work handler implements a tiny response state machine:
+ * Current value-pair protocol:
  *
- *   TRACE_TX_BEGIN -> send "T_BEGIN\n"
- *   TRACE_TX_DATA  -> send multiple "T=...\n" chunks
- *   TRACE_TX_END   -> send "T_END\n"
+ *   TB;N=<point_count>
+ *   P<index>;V=<voltage_mV>;I=<current_nA>
+ *   P<index>;V=<voltage_mV>;I=<current_nA>
+ *   ...
+ *   TE;N=<point_count>
  *
- * It runs outside the NUS RX callback so that receiving a command and sending
- * a longer response are not tightly coupled inside one callback invocation.
+ * Example:
+ *
+ *   TB;N=3
+ *   P0;V=-800;I=-21
+ *   P1;V=-770;I=-18
+ *   P2;V=-740;I=-14
+ *   TE;N=3
+ *
+ * This work handler runs outside the NUS RX callback. That keeps command
+ * reception and longer trace transmission structurally separated.
  */
 static void trace_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
 	int err;
+	char line[32];
 
 	if (trace_conn == NULL) {
 		finish_trace_transfer();
@@ -181,7 +134,9 @@ static void trace_work_handler(struct k_work *work)
 
 	switch (trace_phase) {
 	case TRACE_TX_BEGIN:
-		err = send_text_notification(trace_conn, "T_BEGIN\n");
+		snprintk(line, sizeof(line), "TB;N=%d\n", ARRAY_SIZE(fake_trace));
+
+		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
 			printk("Failed to send trace begin: %d\n", err);
 			finish_trace_transfer();
@@ -194,24 +149,23 @@ static void trace_work_handler(struct k_work *work)
 
 	case TRACE_TX_DATA:
 		if (trace_index < ARRAY_SIZE(fake_trace)) {
-			char line[TRACE_NOTIFY_MAX_BYTES + 1];
-			size_t values_sent;
+			const struct trace_point *point = &fake_trace[trace_index];
 
-			values_sent = build_trace_chunk(line, sizeof(line), trace_index);
-			if (values_sent == 0) {
-				printk("Failed to build trace chunk\n");
-				finish_trace_transfer();
-				return;
-			}
+			snprintk(line, sizeof(line),
+				 "P%d;V=%d;I=%d\n",
+				 trace_index,
+				 point->voltage_mv,
+				 point->current_na);
 
 			err = send_text_notification(trace_conn, line);
 			if (err < 0) {
-				printk("Failed to send trace chunk: %d\n", err);
+				printk("Failed to send trace point %d: %d\n",
+				       trace_index, err);
 				finish_trace_transfer();
 				return;
 			}
 
-			trace_index += values_sent;
+			trace_index++;
 			k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS));
 		} else {
 			trace_phase = TRACE_TX_END;
@@ -220,7 +174,9 @@ static void trace_work_handler(struct k_work *work)
 		break;
 
 	case TRACE_TX_END:
-		err = send_text_notification(trace_conn, "T_END\n");
+		snprintk(line, sizeof(line), "TE;N=%d\n", ARRAY_SIZE(fake_trace));
+
+		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
 			printk("Failed to send trace end: %d\n", err);
 		}
@@ -238,9 +194,9 @@ static void trace_work_handler(struct k_work *work)
 /**
  * @brief Start sending a multi-notification trace response.
  *
- * Only one trace transfer is allowed at a time in this MVP. If a second command
- * arrives while a trace is still being sent, the firmware responds with
- * "ERR=BUSY\n".
+ * Only one trace transfer is allowed at a time in this MVP.
+ * If another complete command arrives while a trace is still being sent,
+ * firmware responds with ERR=BUSY.
  */
 static void start_trace_transfer(struct bt_conn *conn)
 {
@@ -276,31 +232,31 @@ static void notif_enabled(bool enabled, void *ctx)
  *
  *   '#'
  *
- * Example:
+ * Example app writes:
  *
- *   Write 1: "START=-800;"
- *   Write 2: "END=0;"
- *   Write 3: "FREQ=100;"
- *   Write 4: "RANGE=10#"
+ *   START=-800;
+ *   END=0;
+ *   FREQ=100;
+ *   RANGE=10#
  *
  * Reconstructed command:
  *
- *   "START=-800;END=0;FREQ=100;RANGE=10"
+ *   START=-800;END=0;FREQ=100;RANGE=10
  *
  * Notification behavior:
  *
  * - Non-final fragment:
- *     "FRAG_OK\n"
+ *     FRAG_OK
  *
  * - Final fragment containing '#':
- *     multi-notification trace response:
- *       "T_BEGIN\n"
- *       "T=...\n"
+ *     starts multi-notification trace response:
+ *       TB;N=<point_count>
+ *       P<index>;V=<voltage_mV>;I=<current_nA>
  *       ...
- *       "T_END\n"
+ *       TE;N=<point_count>
  *
  * - Buffer overflow:
- *     "ERR=RX_OVERFLOW\n"
+ *     ERR=RX_OVERFLOW
  */
 static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
 {
@@ -352,7 +308,7 @@ int main(void)
 {
 	int err;
 
-	printk("Sample - Bluetooth Peripheral NUS Fragmented Command Chunked Trace\n");
+	printk("Sample - Bluetooth Peripheral NUS Value-Pair Trace Protocol\n");
 
 	k_work_init_delayable(&trace_work, trace_work_handler);
 
