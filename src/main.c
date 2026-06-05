@@ -65,6 +65,7 @@ enum trace_tx_phase {
 
 static enum trace_tx_phase trace_phase = TRACE_TX_IDLE;
 static struct k_work_delayable trace_work;
+static struct k_work_delayable adv_restart_work;
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -73,6 +74,45 @@ static const struct bt_data ad[] = {
 
 static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_SRV_VAL),
+};
+
+static void finish_trace_transfer(void);
+
+static void adv_restart_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+				   ad, ARRAY_SIZE(ad),
+				   sd, ARRAY_SIZE(sd));
+	if (err) {
+		printk("Failed to restart advertising: %d\n", err);
+	} else {
+		printk("Advertising restarted\n");
+	}
+}
+
+static void on_connected(struct bt_conn *conn, uint8_t err)
+{
+	if (err) {
+		printk("Connection failed: %u\n", err);
+		return;
+	}
+	printk("Connected\n");
+}
+
+static void on_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	printk("Disconnected (reason %u)\n", reason);
+
+	finish_trace_transfer();
+
+	k_work_schedule(&adv_restart_work, K_MSEC(100));
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected    = on_connected,
+	.disconnected = on_disconnected,
 };
 
 static int send_text_notification(struct bt_conn *conn, const char *text)
@@ -311,6 +351,7 @@ int main(void)
 	printk("Sample - Bluetooth Peripheral NUS Value-Pair Trace Protocol\n");
 
 	k_work_init_delayable(&trace_work, trace_work_handler);
+	k_work_init_delayable(&adv_restart_work, adv_restart_handler);
 
 	err = bt_nus_cb_register(&nus_listener, NULL);
 	if (err) {
