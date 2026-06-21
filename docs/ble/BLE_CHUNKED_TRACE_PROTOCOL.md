@@ -7,7 +7,7 @@ This firmware branch implements a BLE dummy device that:
 1. Receives a measurement command over BLE in multiple write fragments
 2. Reconstructs the full command on the device
 3. Sends a trace response back over multiple BLE notifications
-4. Represents trace data as ordered voltage/current pairs
+4. Represents trace data as ordered voltage/current pairs with scale factors
 
 The firmware uses Nordic UART Service-style communication.
 
@@ -72,38 +72,88 @@ After the final command fragment, firmware sends the trace as a notification seq
 Frame format:
 
 ```text
-TB;N=<point_count>
-P<index>;V=<voltage_mV>;I=<current_nA>
+TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
+P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
 ...
 TE;N=<point_count>
 ```
 
-Example:
+Where:
 
 ```text
-TB;N=10
-P0;V=-800;I=-21
-P1;V=-770;I=-18
-P2;V=-740;I=-14
-P3;V=-710;I=-10
-P4;V=-680;I=-7
-P5;V=-650;I=-5
-P6;V=-620;I=-3
-P7;V=-590;I=-2
-P8;V=-560;I=-1
-P9;V=-530;I=0
-TE;N=10
+TB  = trace begin
+N   = number of trace points
+XS  = x-axis scale factor (integer)
+YS  = y-axis scale factor (integer)
+P   = one trace point
+V   = voltage scaled integer
+I   = current scaled integer
+TE  = trace end
 ```
 
-Meaning:
+---
+
+## Scaled Values
+
+`V` and `I` in P-frames are **scaled integers**, not direct physical values.
+
+To recover physical units, divide by the scale factors from the TB header:
 
 ```text
-TB = trace begin
-N  = number of trace points
-P  = one trace point
-V  = voltage in millivolts
-I  = current in nanoamps
-TE = trace end
+real_voltage_mV = V / XS
+real_current_nA = I / YS
+```
+
+Example using current scale factors (`XS=1000`, `YS=1000000`):
+
+```text
+P0;V=-340040;I=406027  →  -340040 / 1000 = -340.040 mV,  406027 / 1000000 = 0.406027 nA
+```
+
+Flutter receiver implementation is a separate future task.
+
+---
+
+## Example Trace Response
+
+```text
+TB;N=35;XS=1000;YS=1000000
+P0;V=-340040;I=406027
+P1;V=-330040;I=385046
+P2;V=-320041;I=374079
+P3;V=-310040;I=387907
+P4;V=-300040;I=367403
+P5;V=-290040;I=371695
+P6;V=-280040;I=387430
+P7;V=-270041;I=413179
+P8;V=-260040;I=455618
+P9;V=-250040;I=509024
+P10;V=-240040;I=583887
+P11;V=-230040;I=652080
+P12;V=-220040;I=734572
+P13;V=-210040;I=804191
+P14;V=-200118;I=817542
+P15;V=-190118;I=830894
+P16;V=-180118;I=796561
+P17;V=-170117;I=740294
+P18;V=-160118;I=673537
+P19;V=-150118;I=592470
+P20;V=-140118;I=535727
+P21;V=-130117;I=481367
+P22;V=-120117;I=446558
+P23;V=-110118;I=417948
+P24;V=-100118;I=395060
+P25;V=-90117;I=385046
+P26;V=-80117;I=382185
+P27;V=-70117;I=378370
+P28;V=-60196;I=382185
+P29;V=-50196;I=377417
+P30;V=-40195;I=378370
+P31;V=-30195;I=379801
+P32;V=-20195;I=393152
+P33;V=-10196;I=395536
+P34;V=-196;I=403643
+TE;N=35
 ```
 
 ---
@@ -138,7 +188,7 @@ TRACE_TX_END
 Flow:
 
 ```text
-TRACE_TX_BEGIN -> send TB;N=<point_count>
+TRACE_TX_BEGIN -> send TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
 TRACE_TX_DATA  -> send one P frame per trace point
 TRACE_TX_END   -> send TE;N=<point_count>
 TRACE_TX_IDLE  -> transfer finished
@@ -148,37 +198,16 @@ TRACE_TX_IDLE  -> transfer finished
 
 ## Current Trace Data Model
 
-The firmware stores fake trace data as voltage/current pairs:
+The firmware stores trace data as scaled integer pairs:
 
 ```c
 struct trace_point {
-    int16_t voltage_mv;
-    int16_t current_na;
+    int32_t voltage_mv_scaled;
+    int32_t current_na_scaled;
 };
 ```
 
-Example:
-
-```c
-static const struct trace_point fake_trace[] = {
-    { -800, -21 },
-    { -770, -18 },
-    { -740, -14 },
-    { -710, -10 },
-    { -680, -7  },
-    { -650, -5  },
-    { -620, -3  },
-    { -590, -2  },
-    { -560, -1  },
-    { -530,  0  },
-};
-```
-
-Each point is serialized as:
-
-```text
-P<index>;V=<voltage_mV>;I=<current_nA>
-```
+`int32_t` is required because scaled voltage values reach ±340,040, which overflows `int16_t`.
 
 ---
 
@@ -196,20 +225,18 @@ FREQ=100;
 RANGE=10#
 ```
 
-3. Confirm notification sequence:
+3. Confirm notification sequence begins with:
 
 ```text
-FRAG_OK
-FRAG_OK
-FRAG_OK
-TB;N=10
-P0;V=-800;I=-21
-...
-P9;V=-530;I=0
-TE;N=10
+TB;N=35;XS=1000;YS=1000000
 ```
 
-The notification history showed successful reception of all frames.
+4. Confirm 35 P-frames arrive and end with `TE;N=35`
+5. Spot-check scale reconstruction:
+   - `P0;V=-340040;I=406027` → `-340.040 mV`, `0.406027 nA`
+   - `P15;V=-190118;I=830894` → `-190.118 mV`, `0.830894 nA`
+   - `P34;V=-196;I=403643` → `-0.196 mV`, `0.403643 nA`
+6. RTT log confirms `result: 0` for all `Notify send:` lines
 
 ---
 
@@ -217,12 +244,12 @@ The notification history showed successful reception of all frames.
 
 ```text
 - command values are not parsed yet
-- trace data is hard-coded
+- trace data is hard-coded (35 real measurement points)
 - only one trace transfer is supported at a time
 - # is used as command terminator for manual testing
 - no checksum or retry mechanism yet
 - no protocol version frame yet
-- text protocol is optimized for debuggability, not bandwidth
+- Flutter receiver not yet implemented
 ```
 
 ---
@@ -232,16 +259,17 @@ The notification history showed successful reception of all frames.
 Recommended next firmware steps:
 
 1. Parse command values from the reconstructed command
-2. Generate fake trace points based on command values
-3. Add validation for malformed commands
-4. Add protocol versioning if the app integration becomes stable
-5. Add checksum or transfer ID later if needed
+2. Add validation for malformed commands
+3. Add protocol versioning if the app integration becomes stable
+4. Add checksum or transfer ID later if needed
 
 Recommended mobile app steps:
 
 1. Subscribe to NUS TX before writing
 2. Write command fragments sequentially to NUS RX
 3. Wait for `FRAG_OK` after non-final fragments
-4. Parse `TB`, `P`, and `TE` notification frames
-5. Validate point count and point indices
-6. Map decoded points into the app trace model
+4. Parse `TB` header — extract `N`, `XS`, `YS`
+5. Parse `P` frames — extract index, `V`, `I`
+6. Apply scale: `real_mV = V / XS`, `real_nA = I / YS`
+7. Validate point count and point indices
+8. Map decoded points into the app trace model

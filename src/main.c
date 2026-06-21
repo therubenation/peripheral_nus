@@ -19,37 +19,41 @@
 #define RX_BUF_SIZE             128
 #define CMD_TERMINATOR          '#'
 #define TRACE_SEND_DELAY_MS     30
+#define TRACE_X_SCALE           1000
+#define TRACE_Y_SCALE           1000000
 
 static char rx_buf[RX_BUF_SIZE];
 static size_t rx_len = 0;
 
 struct trace_point {
-	int16_t voltage_mv;
-	int16_t current_na;
+	int32_t voltage_mv_scaled;   /* int32_t: values reach ±340040, overflows int16_t */
+	int32_t current_na_scaled;   /* int32_t: values reach 830894, overflows int16_t */
 };
 
 /*
- * Fake CV-like trace data.
+ * Real IV-curve measurement data (result_001_scaled.json).
  *
- * Protocol meaning:
- * V = voltage in millivolts
- * I = current in nanoamps
+ * Values are scaled integers. To recover physical units:
+ *   real_voltage_mV = voltage_mv_scaled / TRACE_X_SCALE
+ *   real_current_nA = current_na_scaled / TRACE_Y_SCALE
  *
  * Each point will be sent as one notification:
  *
- *   P<index>;V=<voltage_mV>;I=<current_nA>
+ *   P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
  */
-static const struct trace_point fake_trace[] = {
-	{ -800, -21 },
-	{ -770, -18 },
-	{ -740, -14 },
-	{ -710, -10 },
-	{ -680, -7  },
-	{ -650, -5  },
-	{ -620, -3  },
-	{ -590, -2  },
-	{ -560, -1  },
-	{ -530,  0  },
+static const struct trace_point trace_data[] = {
+	{ -340040, 406027 }, { -330040, 385046 }, { -320041, 374079 },
+	{ -310040, 387907 }, { -300040, 367403 }, { -290040, 371695 },
+	{ -280040, 387430 }, { -270041, 413179 }, { -260040, 455618 },
+	{ -250040, 509024 }, { -240040, 583887 }, { -230040, 652080 },
+	{ -220040, 734572 }, { -210040, 804191 }, { -200118, 817542 },
+	{ -190118, 830894 }, { -180118, 796561 }, { -170117, 740294 },
+	{ -160118, 673537 }, { -150118, 592470 }, { -140118, 535727 },
+	{ -130117, 481367 }, { -120117, 446558 }, { -110118, 417948 },
+	{ -100118, 395060 }, { -90117,  385046 }, { -80117,  382185 },
+	{ -70117,  378370 }, { -60196,  382185 }, { -50196,  377417 },
+	{ -40195,  378370 }, { -30195,  379801 }, { -20195,  393152 },
+	{ -10196,  395536 }, { -196,    403643 },
 };
 
 static size_t trace_index = 0;
@@ -141,21 +145,16 @@ static void finish_trace_transfer(void)
 /**
  * @brief Send the trace response as several NUS notifications.
  *
- * Current value-pair protocol:
+ * Protocol:
  *
- *   TB;N=<point_count>
- *   P<index>;V=<voltage_mV>;I=<current_nA>
- *   P<index>;V=<voltage_mV>;I=<current_nA>
+ *   TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
+ *   P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
  *   ...
  *   TE;N=<point_count>
  *
- * Example:
- *
- *   TB;N=3
- *   P0;V=-800;I=-21
- *   P1;V=-770;I=-18
- *   P2;V=-740;I=-14
- *   TE;N=3
+ * V and I are scaled integers. To recover physical units:
+ *   real_voltage_mV = V / XS
+ *   real_current_nA = I / YS
  *
  * This work handler runs outside the NUS RX callback. That keeps command
  * reception and longer trace transmission structurally separated.
@@ -165,7 +164,7 @@ static void trace_work_handler(struct k_work *work)
 	ARG_UNUSED(work);
 
 	int err;
-	char line[32];
+	char line[48];
 
 	if (trace_conn == NULL) {
 		finish_trace_transfer();
@@ -174,7 +173,8 @@ static void trace_work_handler(struct k_work *work)
 
 	switch (trace_phase) {
 	case TRACE_TX_BEGIN:
-		snprintk(line, sizeof(line), "TB;N=%d\n", ARRAY_SIZE(fake_trace));
+		snprintk(line, sizeof(line), "TB;N=%d;XS=%d;YS=%d\n",
+			 ARRAY_SIZE(trace_data), TRACE_X_SCALE, TRACE_Y_SCALE);
 
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
@@ -188,14 +188,14 @@ static void trace_work_handler(struct k_work *work)
 		break;
 
 	case TRACE_TX_DATA:
-		if (trace_index < ARRAY_SIZE(fake_trace)) {
-			const struct trace_point *point = &fake_trace[trace_index];
+		if (trace_index < ARRAY_SIZE(trace_data)) {
+			const struct trace_point *point = &trace_data[trace_index];
 
 			snprintk(line, sizeof(line),
 				 "P%d;V=%d;I=%d\n",
 				 trace_index,
-				 point->voltage_mv,
-				 point->current_na);
+				 point->voltage_mv_scaled,
+				 point->current_na_scaled);
 
 			err = send_text_notification(trace_conn, line);
 			if (err < 0) {
@@ -214,7 +214,7 @@ static void trace_work_handler(struct k_work *work)
 		break;
 
 	case TRACE_TX_END:
-		snprintk(line, sizeof(line), "TE;N=%d\n", ARRAY_SIZE(fake_trace));
+		snprintk(line, sizeof(line), "TE;N=%d\n", ARRAY_SIZE(trace_data));
 
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
