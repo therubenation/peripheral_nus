@@ -40,7 +40,7 @@ struct trace_point {
  *
  * Each point will be sent as one notification:
  *
- *   P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
+ *   <index>,<voltage_mv_scaled>,<current_na_scaled>
  */
 static const struct trace_point trace_data[] = {
 	{ -340040, 406027 }, { -330040, 385046 }, { -320041, 374079 },
@@ -64,6 +64,7 @@ static bool trace_tx_busy = false;
 enum trace_tx_phase {
 	TRACE_TX_IDLE,
 	TRACE_TX_BEGIN,
+	TRACE_TX_SCALE,
 	TRACE_TX_DATA,
 	TRACE_TX_END,
 };
@@ -141,12 +142,14 @@ static void finish_trace_transfer(void)
  * Compact protocol (all frames ≤ 18 bytes, fits default BLE payload):
  *
  *   B<count>
+ *   S<x_scale>,<y_scale>
  *   <index>,<voltage_mv_scaled>,<current_na_scaled>
  *   ...
  *   E<count>
  *
- * Scaled values use TRACE_X_SCALE / TRACE_Y_SCALE (see defines above).
- * Receiver must divide by these to recover physical units.
+ * The S frame carries the scale factors needed to reconstruct physical units:
+ *   real_voltage_mV = voltage_mv_scaled / x_scale
+ *   real_current_nA = current_na_scaled / y_scale
  *
  * This work handler runs outside the NUS RX callback. That keeps command
  * reception and longer trace transmission structurally separated.
@@ -171,6 +174,22 @@ static void trace_work_handler(struct k_work *work)
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
 			printk("Failed to send trace begin: %d\n", err);
+			finish_trace_transfer();
+			return;
+		}
+
+		trace_phase = TRACE_TX_SCALE;
+		k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS));
+		break;
+
+	case TRACE_TX_SCALE:
+		snprintk(line, sizeof(line), "S%d,%d\n",
+			 TRACE_X_SCALE,
+			 TRACE_Y_SCALE);
+
+		err = send_text_notification(trace_conn, line);
+		if (err < 0) {
+			printk("Failed to send scale frame: %d\n", err);
 			finish_trace_transfer();
 			return;
 		}

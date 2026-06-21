@@ -72,88 +72,88 @@ After the final command fragment, firmware sends the trace as a notification seq
 Frame format:
 
 ```text
-TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
-P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
+B<count>
+S<x_scale>,<y_scale>
+<index>,<voltage_mv_scaled>,<current_na_scaled>
 ...
-TE;N=<point_count>
+E<count>
 ```
 
 Where:
 
 ```text
-TB  = trace begin
-N   = number of trace points
-XS  = x-axis scale factor (integer)
-YS  = y-axis scale factor (integer)
-P   = one trace point
+B   = trace begin, count appended directly (e.g. B35)
+S   = scale metadata: x_scale then y_scale, comma-separated
+idx = trace point index (0-based)
 V   = voltage scaled integer
 I   = current scaled integer
-TE  = trace end
+E   = trace end, count appended directly (e.g. E35)
 ```
+
+All frames are ≤ 18 bytes and fit the default BLE payload without MTU negotiation.
 
 ---
 
 ## Scaled Values
 
-`V` and `I` in P-frames are **scaled integers**, not direct physical values.
+`V` and `I` in data frames are **scaled integers**, not direct physical values.
 
-To recover physical units, divide by the scale factors from the TB header:
+To recover physical units, divide by the scale factors from the S frame:
 
 ```text
 real_voltage_mV = V / XS
 real_current_nA = I / YS
 ```
 
-Example using current scale factors (`XS=1000`, `YS=1000000`):
+Example using `S1000,1000000`:
 
 ```text
-P0;V=-340040;I=406027  →  -340040 / 1000 = -340.040 mV,  406027 / 1000000 = 0.406027 nA
+0,-340040,406027  →  -340040 / 1000 = -340.040 mV,  406027 / 1000000 = 0.406027 nA
 ```
-
-Flutter receiver implementation is a separate future task.
 
 ---
 
 ## Example Trace Response
 
 ```text
-TB;N=35;XS=1000;YS=1000000
-P0;V=-340040;I=406027
-P1;V=-330040;I=385046
-P2;V=-320041;I=374079
-P3;V=-310040;I=387907
-P4;V=-300040;I=367403
-P5;V=-290040;I=371695
-P6;V=-280040;I=387430
-P7;V=-270041;I=413179
-P8;V=-260040;I=455618
-P9;V=-250040;I=509024
-P10;V=-240040;I=583887
-P11;V=-230040;I=652080
-P12;V=-220040;I=734572
-P13;V=-210040;I=804191
-P14;V=-200118;I=817542
-P15;V=-190118;I=830894
-P16;V=-180118;I=796561
-P17;V=-170117;I=740294
-P18;V=-160118;I=673537
-P19;V=-150118;I=592470
-P20;V=-140118;I=535727
-P21;V=-130117;I=481367
-P22;V=-120117;I=446558
-P23;V=-110118;I=417948
-P24;V=-100118;I=395060
-P25;V=-90117;I=385046
-P26;V=-80117;I=382185
-P27;V=-70117;I=378370
-P28;V=-60196;I=382185
-P29;V=-50196;I=377417
-P30;V=-40195;I=378370
-P31;V=-30195;I=379801
-P32;V=-20195;I=393152
-P33;V=-10196;I=395536
-P34;V=-196;I=403643
-TE;N=35
+B35
+S1000,1000000
+0,-340040,406027
+1,-330040,385046
+2,-320041,374079
+3,-310040,387907
+4,-300040,367403
+5,-290040,371695
+6,-280040,387430
+7,-270041,413179
+8,-260040,455618
+9,-250040,509024
+10,-240040,583887
+11,-230040,652080
+12,-220040,734572
+13,-210040,804191
+14,-200118,817542
+15,-190118,830894
+16,-180118,796561
+17,-170117,740294
+18,-160118,673537
+19,-150118,592470
+20,-140118,535727
+21,-130117,481367
+22,-120117,446558
+23,-110118,417948
+24,-100118,395060
+25,-90117,385046
+26,-80117,382185
+27,-70117,378370
+28,-60196,382185
+29,-50196,377417
+30,-40195,378370
+31,-30195,379801
+32,-20195,393152
+33,-10196,395536
+34,-196,403643
+E35
 ```
 
 ---
@@ -181,6 +181,7 @@ The trace transfer state machine is:
 ```text
 TRACE_TX_IDLE
 TRACE_TX_BEGIN
+TRACE_TX_SCALE
 TRACE_TX_DATA
 TRACE_TX_END
 ```
@@ -188,9 +189,10 @@ TRACE_TX_END
 Flow:
 
 ```text
-TRACE_TX_BEGIN -> send TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
-TRACE_TX_DATA  -> send one P frame per trace point
-TRACE_TX_END   -> send TE;N=<point_count>
+TRACE_TX_BEGIN -> send B<count>
+TRACE_TX_SCALE -> send S<x_scale>,<y_scale>
+TRACE_TX_DATA  -> send one data frame per trace point
+TRACE_TX_END   -> send E<count>
 TRACE_TX_IDLE  -> transfer finished
 ```
 
@@ -228,14 +230,15 @@ RANGE=10#
 3. Confirm notification sequence begins with:
 
 ```text
-TB;N=35;XS=1000;YS=1000000
+B35
+S1000,1000000
 ```
 
-4. Confirm 35 P-frames arrive and end with `TE;N=35`
-5. Spot-check scale reconstruction:
-   - `P0;V=-340040;I=406027` → `-340.040 mV`, `0.406027 nA`
-   - `P15;V=-190118;I=830894` → `-190.118 mV`, `0.830894 nA`
-   - `P34;V=-196;I=403643` → `-0.196 mV`, `0.403643 nA`
+4. Confirm 35 data frames arrive and end with `E35`
+5. Spot-check scale reconstruction using `XS=1000`, `YS=1000000`:
+   - `0,-340040,406027` → `-340.040 mV`, `0.406027 nA`
+   - `15,-190118,830894` → `-190.118 mV`, `0.830894 nA`
+   - `34,-196,403643` → `-0.196 mV`, `0.403643 nA`
 6. RTT log confirms `result: 0` for all `Notify send:` lines
 
 ---
@@ -268,8 +271,8 @@ Recommended mobile app steps:
 1. Subscribe to NUS TX before writing
 2. Write command fragments sequentially to NUS RX
 3. Wait for `FRAG_OK` after non-final fragments
-4. Parse `TB` header — extract `N`, `XS`, `YS`
-5. Parse `P` frames — extract index, `V`, `I`
-6. Apply scale: `real_mV = V / XS`, `real_nA = I / YS`
-7. Validate point count and point indices
+4. On `B<count>`: start transfer, store expected point count
+5. On `S<xs>,<ys>`: store scale factors
+6. On `<idx>,<V>,<I>`: extract and scale: `real_mV = V / xs`, `real_nA = I / ys`
+7. On `E<count>`: validate count matches B, finish transfer
 8. Map decoded points into the app trace model
