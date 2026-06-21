@@ -138,16 +138,15 @@ static void finish_trace_transfer(void)
 /**
  * @brief Send the trace response as several NUS notifications.
  *
- * Protocol:
+ * Compact protocol (all frames ≤ 18 bytes, fits default BLE payload):
  *
- *   TB;N=<point_count>;XS=<x_scale>;YS=<y_scale>
- *   P<index>;V=<voltage_mv_scaled>;I=<current_na_scaled>
+ *   B<count>
+ *   <index>,<voltage_mv_scaled>,<current_na_scaled>
  *   ...
- *   TE;N=<point_count>
+ *   E<count>
  *
- * V and I are scaled integers. To recover physical units:
- *   real_voltage_mV = V / XS
- *   real_current_nA = I / YS
+ * Scaled values use TRACE_X_SCALE / TRACE_Y_SCALE (see defines above).
+ * Receiver must divide by these to recover physical units.
  *
  * This work handler runs outside the NUS RX callback. That keeps command
  * reception and longer trace transmission structurally separated.
@@ -166,10 +165,8 @@ static void trace_work_handler(struct k_work *work)
 
 	switch (trace_phase) {
 	case TRACE_TX_BEGIN:
-		snprintk(line, sizeof(line), "TB;N=%u;XS=%d;YS=%d\n",
-			 (unsigned int)ARRAY_SIZE(trace_data),
-			 TRACE_X_SCALE,
-			 TRACE_Y_SCALE);
+		snprintk(line, sizeof(line), "B%u\n",
+			 (unsigned int)ARRAY_SIZE(trace_data));
 
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
@@ -187,7 +184,7 @@ static void trace_work_handler(struct k_work *work)
 			const struct trace_point *point = &trace_data[trace_index];
 
 			snprintk(line, sizeof(line),
-				 "P%u;V=%d;I=%d\n",
+				 "%u,%d,%d\n",
 				 (unsigned int)trace_index,
 				 point->voltage_mv_scaled,
 				 point->current_na_scaled);
@@ -209,7 +206,7 @@ static void trace_work_handler(struct k_work *work)
 		break;
 
 	case TRACE_TX_END:
-		snprintk(line, sizeof(line), "TE;N=%u\n",
+		snprintk(line, sizeof(line), "E%u\n",
 			 (unsigned int)ARRAY_SIZE(trace_data));
 
 		err = send_text_notification(trace_conn, line);
@@ -344,15 +341,18 @@ int main(void)
 
 	k_work_init_delayable(&trace_work, trace_work_handler);
 
-	err = bt_enable(NULL);
-	if (err) {
-		printk("Failed to enable Bluetooth: %d\n", err);
-		return err;
-	}
-
+	/* Register NUS callbacks before bt_enable — safe because bt_nus_cb_register
+	 * only appends to a statically-initialized slist and has no BT stack dependency.
+	 * This matches the official Zephyr peripheral_nus sample pattern. */
 	err = bt_nus_cb_register(&nus_listener, NULL);
 	if (err) {
 		printk("Failed to register NUS callback: %d\n", err);
+		return err;
+	}
+
+	err = bt_enable(NULL);
+	if (err) {
+		printk("Failed to enable Bluetooth: %d\n", err);
 		return err;
 	}
 
