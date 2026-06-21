@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -69,7 +70,13 @@ enum trace_tx_phase {
 
 static enum trace_tx_phase trace_phase = TRACE_TX_IDLE;
 static struct k_work_delayable trace_work;
-static struct k_work_delayable adv_restart_work;
+
+/*
+ * Signalled from on_disconnected() to wake the main loop for advertising restart.
+ * Avoids calling bt_le_adv_start() from a BT callback or a work handler,
+ * both of which previously caused MPU faults on this target.
+ */
+K_SEM_DEFINE(adv_restart_sem, 0, 1);
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -81,20 +88,6 @@ static const struct bt_data sd[] = {
 };
 
 static void finish_trace_transfer(void);
-
-static void adv_restart_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
-				   ad, ARRAY_SIZE(ad),
-				   sd, ARRAY_SIZE(sd));
-	if (err) {
-		printk("Failed to restart advertising: %d\n", err);
-	} else {
-		printk("Advertising restarted\n");
-	}
-}
 
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -111,7 +104,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 
 	finish_trace_transfer();
 
-	k_work_schedule(&adv_restart_work, K_MSEC(100));
+	k_sem_give(&adv_restart_sem);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -173,8 +166,10 @@ static void trace_work_handler(struct k_work *work)
 
 	switch (trace_phase) {
 	case TRACE_TX_BEGIN:
-		snprintk(line, sizeof(line), "TB;N=%d;XS=%d;YS=%d\n",
-			 ARRAY_SIZE(trace_data), TRACE_X_SCALE, TRACE_Y_SCALE);
+		snprintk(line, sizeof(line), "TB;N=%u;XS=%d;YS=%d\n",
+			 (unsigned int)ARRAY_SIZE(trace_data),
+			 TRACE_X_SCALE,
+			 TRACE_Y_SCALE);
 
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
@@ -192,15 +187,15 @@ static void trace_work_handler(struct k_work *work)
 			const struct trace_point *point = &trace_data[trace_index];
 
 			snprintk(line, sizeof(line),
-				 "P%d;V=%d;I=%d\n",
-				 trace_index,
+				 "P%u;V=%d;I=%d\n",
+				 (unsigned int)trace_index,
 				 point->voltage_mv_scaled,
 				 point->current_na_scaled);
 
 			err = send_text_notification(trace_conn, line);
 			if (err < 0) {
-				printk("Failed to send trace point %d: %d\n",
-				       trace_index, err);
+				printk("Failed to send trace point %u: %d\n",
+				       (unsigned int)trace_index, err);
 				finish_trace_transfer();
 				return;
 			}
@@ -214,7 +209,8 @@ static void trace_work_handler(struct k_work *work)
 		break;
 
 	case TRACE_TX_END:
-		snprintk(line, sizeof(line), "TE;N=%d\n", ARRAY_SIZE(trace_data));
+		snprintk(line, sizeof(line), "TE;N=%u\n",
+			 (unsigned int)ARRAY_SIZE(trace_data));
 
 		err = send_text_notification(trace_conn, line);
 		if (err < 0) {
@@ -289,11 +285,7 @@ static void notif_enabled(bool enabled, void *ctx)
  *     FRAG_OK
  *
  * - Final fragment containing '#':
- *     starts multi-notification trace response:
- *       TB;N=<point_count>
- *       P<index>;V=<voltage_mV>;I=<current_nA>
- *       ...
- *       TE;N=<point_count>
+ *     starts multi-notification trace response
  *
  * - Buffer overflow:
  *     ERR=RX_OVERFLOW
@@ -305,8 +297,8 @@ static void received(struct bt_conn *conn, const void *data, uint16_t len, void 
 
 	ARG_UNUSED(ctx);
 
-	printk("%s() - Len: %d, Fragment: %.*s\n",
-	       __func__, len, len, bytes);
+	printk("%s() - Len: %u, Fragment: %.*s\n",
+	       __func__, (unsigned int)len, (int)len, bytes);
 
 	for (uint16_t i = 0; i < len; i++) {
 		char c = bytes[i];
@@ -351,17 +343,16 @@ int main(void)
 	printk("Sample - Bluetooth Peripheral NUS Value-Pair Trace Protocol\n");
 
 	k_work_init_delayable(&trace_work, trace_work_handler);
-	k_work_init_delayable(&adv_restart_work, adv_restart_handler);
-
-	err = bt_nus_cb_register(&nus_listener, NULL);
-	if (err) {
-		printk("Failed to register NUS callback: %d\n", err);
-		return err;
-	}
 
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Failed to enable Bluetooth: %d\n", err);
+		return err;
+	}
+
+	err = bt_nus_cb_register(&nus_listener, NULL);
+	if (err) {
+		printk("Failed to register NUS callback: %d\n", err);
 		return err;
 	}
 
@@ -376,7 +367,20 @@ int main(void)
 	printk("Initialization complete\n");
 
 	while (true) {
-		k_sleep(K_FOREVER);
+		k_sem_take(&adv_restart_sem, K_FOREVER);
+
+		k_sleep(K_MSEC(200));
+
+		err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+				      ad, ARRAY_SIZE(ad),
+				      sd, ARRAY_SIZE(sd));
+		if (err == -EALREADY) {
+			printk("Advertising already active\n");
+		} else if (err) {
+			printk("Failed to restart advertising: %d\n", err);
+		} else {
+			printk("Advertising restarted\n");
+		}
 	}
 
 	return 0;
