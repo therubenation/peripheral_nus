@@ -4,4 +4,5 @@ project(peripheral_nus)
 
 target_sources(app PRIVATE
         src/main.c
+        src/cmd_parser.c
 )

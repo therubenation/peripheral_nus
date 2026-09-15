@@ -14,12 +14,14 @@
 #include <stdint.h>
 #include <errno.h>
 
+#include "cmd_parser.h"
+
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
 #define RX_BUF_SIZE             128
 #define CMD_TERMINATOR          '#'
-#define TRACE_SEND_DELAY_MS     30
+#define TRACE_SEND_DELAY_MS     60
 #define TRACE_X_SCALE           1000
 #define TRACE_Y_SCALE           1000000
 
@@ -60,6 +62,13 @@ static const struct trace_point trace_data[] = {
 static size_t trace_index = 0;
 static struct bt_conn *trace_conn;
 static bool trace_tx_busy = false;
+
+struct measurement_channel {
+	bool present;
+	uint8_t value;
+};
+
+static struct measurement_channel current_channel;
 
 enum trace_tx_phase {
 	TRACE_TX_IDLE,
@@ -132,6 +141,7 @@ static void finish_trace_transfer(void)
 	trace_index = 0;
 	trace_phase = TRACE_TX_IDLE;
 	trace_tx_busy = false;
+	current_channel = (struct measurement_channel){0};
 
 	printk("Trace transfer finished\n");
 }
@@ -168,6 +178,12 @@ static void trace_work_handler(struct k_work *work)
 
 	switch (trace_phase) {
 	case TRACE_TX_BEGIN:
+		if (current_channel.present) {
+			printk("Starting trace on channel %u\n", current_channel.value);
+		} else {
+			printk("Starting trace (no channel specified)\n");
+		}
+
 		snprintk(line, sizeof(line), "B%u\n",
 			 (unsigned int)ARRAY_SIZE(trace_data));
 
@@ -289,19 +305,31 @@ static void notif_enabled(bool enabled, void *ctx)
  *   START=-800;
  *   END=0;
  *   FREQ=100;
- *   RANGE=10#
+ *   RANGE=10;
+ *   CHANNEL=7#
  *
  * Reconstructed command:
  *
- *   START=-800;END=0;FREQ=100;RANGE=10
+ *   START=-800;END=0;FREQ=100;RANGE=10;CHANNEL=7
+ *
+ * START, END, FREQ, and RANGE are reconstructed but not yet parsed or
+ * validated. Field units (for when parsing is implemented): START/END in
+ * mV, FREQ in Hz, RANGE in µA (changed from nA — do not confuse with the
+ * unrelated nA unit used for measured trace-output current, see
+ * trace_point below). CHANNEL is parsed and validated: it must be an integer in
+ * 0..255, and it is optional (its absence is not an error and is not
+ * treated as channel 0). See cmd_parser.h.
  *
  * Notification behavior:
  *
  * - Non-final fragment:
  *     FRAG_OK
  *
- * - Final fragment containing '#':
+ * - Final fragment containing '#', with a valid or absent CHANNEL:
  *     starts multi-notification trace response
+ *
+ * - Final fragment containing '#', with an invalid CHANNEL value:
+ *     ERR=CHANNEL_INVALID
  *
  * - Buffer overflow:
  *     ERR=RX_OVERFLOW
@@ -320,11 +348,24 @@ static void received(struct bt_conn *conn, const void *data, uint16_t len, void 
 		char c = bytes[i];
 
 		if (c == CMD_TERMINATOR) {
+			uint8_t channel = 0;
+			enum channel_parse_result channel_result;
+
 			rx_buf[rx_len] = '\0';
 
 			printk("Full command: %s\n", rx_buf);
 
-			start_trace_transfer(conn);
+			channel_result = parse_channel_field(rx_buf, &channel);
+
+			if (channel_result == CHANNEL_FIELD_INVALID) {
+				printk("Rejected command: invalid CHANNEL\n");
+				send_text_notification(conn, "ERR=CHANNEL_INVALID\n");
+			} else {
+				current_channel.present = (channel_result == CHANNEL_FIELD_VALID);
+				current_channel.value = channel;
+
+				start_trace_transfer(conn);
+			}
 
 			rx_len = 0;
 			command_completed = true;

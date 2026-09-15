@@ -26,15 +26,23 @@ Example fragmented command::
     START=-800;
     END=0;
     FREQ=100;
-    RANGE=10#
+    RANGE=10;
+    CHANNEL=7#
+
+Field units (for when ``START``/``END``/``FREQ``/``RANGE`` parsing is
+implemented — see "Current Limitations" below): ``START``/``END`` in mV,
+``FREQ`` in Hz, ``RANGE`` in **µA** (changed from nA). Do not confuse
+``RANGE``'s µA with the unrelated nA unit used for *measured* trace-output
+current — that's a different quantity, unaffected by this change.
 
 For every non-final fragment the firmware replies::
 
     FRAG_OK
 
-When the ``#`` terminator is received the full command is logged and a trace
-transfer is started.  If the buffer overflows before the terminator is seen the
-firmware discards the buffer and sends::
+When the ``#`` terminator is received the full command is logged, the
+``CHANNEL`` field (if present) is validated, and a trace transfer is started.
+If the buffer overflows before the terminator is seen the firmware discards
+the buffer and sends::
 
     ERR=RX_OVERFLOW
 
@@ -42,39 +50,53 @@ If a new command arrives while a trace transfer is already in progress::
 
     ERR=BUSY
 
+If ``CHANNEL`` is present but not a valid integer in ``0..255``, the command
+is rejected and no trace transfer is started::
+
+    ERR=CHANNEL_INVALID
+
+``CHANNEL`` is optional; a command without it behaves exactly as before.
+
 Trace response (NUS TX)
 =======================
 
-The trace is delivered as a sequence of NUS notifications separated by 30 ms::
+The trace is delivered as a sequence of NUS notifications separated by 30 ms.
+Every frame is ≤ 18 bytes so it fits the default BLE payload without MTU
+negotiation::
 
-    TB;N=<point_count>
-    P<index>;V=<voltage_mV>;I=<current_nA>
+    B<count>
+    S<x_scale>,<y_scale>
+    <index>,<voltage_mv_scaled>,<current_na_scaled>
     ...
-    TE;N=<point_count>
+    E<count>
 
-Current hardcoded trace data (10 points)::
+``V`` and ``I`` in data frames are scaled integers, not direct physical
+values. Recover physical units from the ``S`` frame's scale factors::
 
-    TB;N=10
-    P0;V=-800;I=-21
-    P1;V=-770;I=-18
-    P2;V=-740;I=-14
-    P3;V=-710;I=-10
-    P4;V=-680;I=-7
-    P5;V=-650;I=-5
-    P6;V=-620;I=-3
-    P7;V=-590;I=-2
-    P8;V=-560;I=-1
-    P9;V=-530;I=0
-    TE;N=10
+    real_voltage_mV = voltage_mv_scaled / x_scale
+    real_current_nA = current_na_scaled / y_scale
+
+Current hardcoded trace data (35 real measurement points, excerpted)::
+
+    B35
+    S1000,1000000
+    0,-340040,406027
+    1,-330040,385046
+    ...
+    34,-196,403643
+    E35
 
 Field meanings:
 
-* ``TB`` – trace begin
-* ``TE`` – trace end
-* ``N``  – number of data points
-* ``P``  – one data point (zero-indexed)
-* ``V``  – voltage in millivolts
-* ``I``  – current in nanoamps
+* ``B``   – trace begin, point count appended directly (e.g. ``B35``)
+* ``S``   – scale metadata: ``x_scale`` then ``y_scale``, comma-separated
+* ``idx`` – trace point index (0-based)
+* ``V``   – voltage, scaled integer
+* ``I``   – current, scaled integer
+* ``E``   – trace end, point count appended directly (e.g. ``E35``)
+
+See ``docs/ble/BLE_CHUNKED_TRACE_PROTOCOL.md`` for the full 35-point example
+and scale-reconstruction worked examples.
 
 Trace state machine
 ===================
@@ -82,7 +104,7 @@ Trace state machine
 Trace transmission runs in a Zephyr delayable work item so it does not block
 the NUS RX callback::
 
-    TRACE_TX_IDLE → TRACE_TX_BEGIN → TRACE_TX_DATA → TRACE_TX_END → TRACE_TX_IDLE
+    TRACE_TX_IDLE → TRACE_TX_BEGIN → TRACE_TX_SCALE → TRACE_TX_DATA → TRACE_TX_END → TRACE_TX_IDLE
 
 Requirements
 ************
@@ -115,7 +137,8 @@ Testing with nRF Connect
        START=-800;
        END=0;
        FREQ=100;
-       RANGE=10#
+       RANGE=10;
+       CHANNEL=7#
 
 5. Observe ``FRAG_OK`` after each non-final write, then the full trace
    notification sequence.
@@ -123,8 +146,13 @@ Testing with nRF Connect
 Current Limitations
 *******************
 
-* Command parameters (``START``, ``END``, ``FREQ``, ``RANGE``) are not parsed;
-  the same hardcoded trace is returned for every command.
+* Command parameters ``START``, ``END``, ``FREQ``, and ``RANGE`` are not
+  parsed; the same hardcoded trace is returned for every command regardless
+  of their values.
+* ``CHANNEL`` is parsed and validated (integer, ``0..255``, optional) and is
+  logged/stored for the duration of the run, but there is no hardware
+  multiplexer/electrode-select path in this firmware yet, so the channel is
+  not physically applied to a measurement.
 * Only one trace transfer is active at a time.
 * ``#`` is used as the command terminator for ease of manual testing.
 * No protocol versioning, checksums, or retry mechanism.
