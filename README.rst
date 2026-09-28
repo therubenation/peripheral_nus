@@ -57,6 +57,12 @@ is rejected and no trace transfer is started::
 
 ``CHANNEL`` is optional; a command without it behaves exactly as before.
 
+A command containing a ``REQ=`` field is a multi-channel measurement request
+(UC8) instead: one request carrying up to 6 channel-specific configurations,
+executed slot by slot by the firmware and answered with one identifiable
+dataset block per slot. Its request format, response frames and outcome
+semantics are specified in ``docs/ble/BLE_CHUNKED_TRACE_PROTOCOL.md``.
+
 Trace response (NUS TX)
 =======================
 
@@ -146,14 +152,16 @@ Testing with nRF Connect
 Current Limitations
 *******************
 
-* Command parameters ``START``, ``END``, ``FREQ``, and ``RANGE`` are not
-  parsed; the same hardcoded trace is returned for every command regardless
-  of their values.
+* In legacy commands, ``START``, ``END``, ``FREQ``, and ``RANGE`` are not
+  parsed. In multi-channel requests they are parsed and validated, but no
+  hardware limits exist yet. Either way the same hardcoded trace is returned
+  for every measurement, regardless of the values.
 * ``CHANNEL`` is parsed and validated (integer, ``0..255``, optional) and is
   logged/stored for the duration of the run, but there is no hardware
   multiplexer/electrode-select path in this firmware yet, so the channel is
   not physically applied to a measurement.
 * Only one trace transfer is active at a time.
 * ``#`` is used as the command terminator for ease of manual testing.
-* No protocol versioning, checksums, or retry mechanism.
+* No protocol versioning or checksums. Failed notifications are retried a
+  few times, then the firmware disconnects.
 * Text-based protocol is optimised for debuggability rather than bandwidth.

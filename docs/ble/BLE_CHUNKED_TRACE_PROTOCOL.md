@@ -199,6 +199,190 @@ E35
 
 ---
 
+## Multi-Channel Measurement Request (UC8)
+
+One request carries the configurations for up to 6 electrode channels. The
+firmware owns the procedure: it runs the acquisitions and returns one
+separately identifiable dataset block per requested slot.
+
+This section is the shared contract between the firmware and the mobile app.
+Firmware has no notion of hormones, analytes, cartridges or calibration; it
+only knows slots, channels and measurement parameters.
+
+### Request
+
+```text
+REQ=<id>;N=<n>;SLOT=0;CHANNEL=<ch>;START=<mV>;END=<mV>;FREQ=<Hz>;RANGE=<µA>;SLOT=1;...;RANGE=<µA>#
+```
+
+- **Legacy vs multi:** a command containing a `REQ=` field is a multi request.
+  A command without it is a legacy single-channel command and behaves exactly
+  as described above.
+- **Header:**
+  - `REQ` is a request ID from 1 to 65535, chosen by the app and echoed back.
+  - `N` is the number of slots, from 1 to 6.
+  - Both must appear before the first `SLOT`, in either order.
+- **Slots:**
+  - `SLOT=k` opens slot k. Slots must be numbered 0, 1, …, N−1 in order.
+  - Each slot needs exactly one of each of `CHANNEL`, `START`, `END`, `FREQ`
+    and `RANGE`, in any order. There must be no duplicates and no other keys.
+- **Units:** the same as the legacy command:
+  - `START` and `END` in mV
+  - `FREQ` in Hz
+  - `RANGE` in µA, the full-scale current range (not the nA used in the
+    trace output)
+- **Transport:** the same fragment, `FRAG_OK` and `#` mechanism as above.
+  - Fragment boundaries are arbitrary; a write may even split a field.
+  - Each write must be ≤ 20 bytes (default ATT MTU).
+  - A 6-slot request is about 340 bytes, and the RX buffer holds 511.
+  - A single trailing `;` before `#` is allowed.
+
+### Slot vs channel
+
+- **Slot** (0..N−1) is the identity of a dataset within one request. The app
+  associates each dataset with its analyte by slot.
+- **Channel** (0..255) is the physical electrode routing. It is echoed in the
+  `C` frame only for verification.
+- **The firmware accepts the same channel in several slots.** The app's
+  cartridge configuration currently forbids duplicate channels. That is a
+  stricter rule at the application level, and the two are compatible:
+  because identity is the slot, lifting the app rule needs no firmware
+  change.
+
+### Response frames
+
+Every frame is ≤ 20 bytes and ends with `\n`.
+
+| Frame | Meaning |
+|---|---|
+| `R<id>,<n>,<t>` | Request accepted. `t` is the firmware's upper bound in seconds on the time until `D`, covering all acquisition and transfer |
+| `C<slot>,<ch>` | Dataset block header. It is sent **only after that slot's acquisition has finished**. It is followed by the unchanged `B<count>`, `S<xs>,<ys>`, `<idx>,<V>,<I>`…, `E<count>` |
+| `X<slot>,<code>` | The device states the slot produced no dataset. `ACQ_FAIL`: acquisition was attempted and failed; the electrode may be affected. `SKIPPED`: acquisition never started; the electrode was not touched (reserved, not emitted yet) |
+| `D<id>,<ok>,<x>` | Procedure finished, with `ok + x == N` |
+| `V<slot>,<key>,<code>` | Request rejected because of a slot field. Terminal: nothing was acquired |
+| `ERR=<code>` | Request rejected at request level. Terminal: nothing was acquired |
+
+Example (3 slots, simulated failure on channel 4):
+
+```text
+R42,3,19
+C0,1
+B35
+S1000,1000000
+0,-340040,406027
+...
+E35
+X1,ACQ_FAIL
+C2,7
+B35
+...
+E35
+D42,2,1
+```
+
+**Guarantees:**
+- Blocks (`C` … `E`) never interleave.
+- Slot order is **unspecified**, so the app must key datasets by slot.
+- Every slot gets exactly one complete block or exactly one `X`, and then
+  `D` follows.
+
+**Deliberately left open:**
+- *When* blocks are sent. The firmware may stream each block as soon as that
+  slot is acquired, or stay silent during acquisitions and send several
+  blocks later (for example, if the radio must be quiet while measuring).
+- *How many* datasets the firmware buffers. The dummy firmware streams each
+  block right after its simulated acquisition and buffers one.
+- The only obligation is that `t` covers whichever strategy is used.
+
+### Validation
+
+Everything is validated **before** `R`. A rejected request never acquires
+anything.
+
+| Level | Checks | Rejection |
+|---|---|---|
+| 1. Syntax (final) | `REQ` and `N` present, before any `SLOT`, not duplicated, `REQ` in 1..65535 | `ERR=SYNTAX` |
+| | `N` in 1..6, number of slots equals `N` | `ERR=SLOT_COUNT` |
+| | `SLOT` sequence 0..N−1 in order, no empty or `=`-less field outside a slot | `ERR=SYNTAX` |
+| | Each slot has all five keys, none duplicated, no unknown keys, strict base-10 int32 values | `V<slot>,<key>,MISSING` / `DUP` / `SYNTAX`, `V<slot>,?,UNKNOWN` |
+| 2. Hardware-independent range (final) | `CHANNEL` 0..255, `FREQ` > 0, `RANGE` > 0 | `V<slot>,<key>,RANGE` |
+| 3. Hardware capability | Voltage window, sweep direction, supported frequencies and ranges, channels that exist | `V<slot>,<key>,HW` |
+
+- Level-1 errors take precedence over level-2 errors. Within a level, the
+  first error in request order is reported.
+- Level 3 is a hook only: the dummy firmware has no hardware limits and
+  accepts everything. The `HW` code and "checked before `R`" are part of the
+  contract; the limit values will come with real hardware.
+- The app's own rules (voltages ≤ 0 and `START` ≤ `END`) are domain rules and
+  are not enforced at level 2, because sign and direction depend on the
+  technique and the hardware.
+- `ERR=BUSY` and `ERR=RX_OVERFLOW` apply as for legacy commands.
+
+### Timeouts
+
+- **Before `R`:** use the `FRAG_OK` timeout for each fragment, then a short
+  timeout for `R`, `V` or `ERR`.
+- **After `R`:** use a single deadline of `R_time + t + margin`. Silence at
+  the application level before the deadline is normal, so there is no
+  per-frame inactivity timeout.
+- **Lost link:** detected by the BLE link-layer supervision timeout and
+  reported as a disconnect. That works even when the firmware sends nothing.
+
+### Slot outcomes: what the app may conclude
+
+| Outcome | Evidence | Safe conclusion |
+|---|---|---|
+| **RECEIVED** | `C…E` complete, `E` count equals `B` count, point indices have no gaps, echoed channel matches the request | Valid dataset. Keep it, whatever happens to later slots |
+| **FAILED** | `X<slot>,ACQ_FAIL` | Acquisition was attempted and failed. The electrode may be affected |
+| **NOT_RUN** | `X<slot>,SKIPPED` | The device states the electrode was not touched |
+| **TRANSFER_INCOMPLETE** | `C` received, then disconnect, deadline, or a protocol violation before a valid `E` | Acquisition **completed** (that is what `C` means), but the data did not arrive. Discard the partial points; never analyse them. **Not** an acquisition failure |
+| **UNKNOWN** | No `C` and no `X` for the slot when the procedure ended without `D` | The slot may not have started, may have been running, or may have finished without being sent. **Not** "not measured" and **not** "failed" |
+
+Rules:
+- Only `X` reports an acquisition failure. A disconnect, an expired deadline
+  or a protocol violation is always a transmission-level outcome
+  (TRANSFER_INCOMPLETE or UNKNOWN).
+- **Protocol violation inside a block** (malformed frame, index gap, count
+  mismatch, wrong echoed channel):
+  - That block becomes TRANSFER_INCOMPLETE.
+  - The app stops interpreting the procedure, and every slot without
+    evidence becomes UNKNOWN.
+  - Earlier RECEIVED blocks are kept.
+- **No repeat guarantee.** Apart from NOT_RUN, the contract does not say a
+  slot can be measured again on the same cartridge, so the app must not
+  repeat slots automatically.
+- **Firmware on disconnect (dummy):** the procedure is abandoned and the
+  firmware returns to idle. Nothing is retained.
+- `REQ` plus slot uniquely identify a measurement, so a later retrieval
+  command can be added without changing any of the above.
+
+### Deferred (additive later, no breaking change)
+
+- `ABORT#` (cancel, which would produce `X<slot>,SKIPPED`)
+- `GET=<id>,<slot>` retrieval and keeping results on the device across a
+  disconnect
+- procedure-level header keys (conditioning, incubation)
+- level-3 limit values
+- binary or MTU-negotiated block encoding
+
+**Needs a contract version bump:**
+- new per-slot keys (unknown keys are rejected)
+- hardware that must stream a block while still acquiring it
+- radio silence at the link level (which would need a disconnect plus
+  retrieval)
+
+### Dummy firmware simulation
+
+- **Acquisition:** each slot waits `ACQ_SIM_MS` (2000 ms) and then streams
+  the same hard-coded 35-point trace.
+- **`t`:** computed as `N × (ACQ_SIM_MS + 39 frames × 60 ms) + 2 × 60 ms`,
+  rounded up to seconds, plus 5 s of slack. For example, `t = 19` for N=3.
+- **Failure injection:** build with
+  `-- -DEXTRA_CFLAGS=-DSIM_FAIL_CHANNEL=<ch>` to make every slot on channel
+  `<ch>` report `X<slot>,ACQ_FAIL`.
+
+---
+
 ## Firmware Behavior
 
 ### Command reception
@@ -216,6 +400,8 @@ The `received()` callback:
 - starts trace transmission after the full command is received, unless
   `CHANNEL` was present and invalid (`ERR=CHANNEL_INVALID`, no transfer
   started)
+- routes commands containing `REQ=` to the multi-channel path (see
+  "Multi-Channel Measurement Request" above)
 
 ### Trace transmission
 
@@ -225,11 +411,25 @@ The trace transfer state machine is:
 
 ```text
 TRACE_TX_IDLE
+TRACE_TX_ACCEPT      (multi only)
+TRACE_TX_ACQUIRE     (multi only)
+TRACE_TX_CHAN_HDR    (multi only)
 TRACE_TX_BEGIN
 TRACE_TX_SCALE
 TRACE_TX_DATA
 TRACE_TX_END
+TRACE_TX_SLOT_FAIL   (multi only)
+TRACE_TX_DONE        (multi only)
 ```
+
+For a multi request the phases run
+`ACCEPT → (ACQUIRE → CHAN_HDR → BEGIN … END | ACQUIRE → SLOT_FAIL)` for each
+slot, then `DONE`.
+
+If a notification fails to send, the same frame is retried up to 3 times
+with increasing back-off. After that the firmware disconnects, so the client
+sees a disconnect rather than silence. This applies to legacy and multi
+transfers alike.
 
 Flow:
 
@@ -310,9 +510,12 @@ write START=-800;END=0;FREQ=100;RANGE=10;CHANNEL=7#
 - CHANNEL is parsed/validated but not physically applied (no mux/ADC
   channel-select hardware or driver exists in this firmware yet)
 - trace data is hard-coded (35 real measurement points)
-- only one trace transfer is supported at a time
+- only one trace transfer (legacy or multi) is supported at a time
+- multi-channel requests: parameters are validated but not applied; every
+  slot returns the same hard-coded trace after a simulated acquisition delay
+- multi-channel requests are host-unit-tested but not yet verified on-target
 - # is used as command terminator for manual testing
-- no checksum or retry mechanism yet
+- no checksum yet
 - no protocol version frame yet
 - Flutter receiver not yet implemented
 ```
@@ -329,7 +532,9 @@ Recommended next firmware steps:
 3. Design and implement physical channel-select hardware (multiplexer or
    addressable analyzer) and wire `CHANNEL` to it — no such hardware exists
    in this firmware today
-4. Handle `send_text_notification()` / `bt_nus_send()` failure during trace
+4. **Done:** send failures are now retried up to 3 times with back-off, then
+   the firmware disconnects (see "Trace transmission"). Original note:
+   Handle `send_text_notification()` / `bt_nus_send()` failure during trace
    transmission more gracefully. Currently (`trace_work_handler()`,
    `TRACE_TX_BEGIN`/`TRACE_TX_SCALE`/`TRACE_TX_DATA`/`TRACE_TX_END` cases),
    any send failure — observed as `-12`/`-ENOMEM` when the BLE stack's TX

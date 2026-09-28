@@ -7,6 +7,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/services/nus.h>
 
 #include <string.h>
@@ -19,11 +20,26 @@
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
-#define RX_BUF_SIZE             128
+#define RX_BUF_SIZE             512     /* fits a 6-slot multi request (~340 bytes) */
 #define CMD_TERMINATOR          '#'
 #define TRACE_SEND_DELAY_MS     60
+#define TRACE_SEND_RETRIES      3
 #define TRACE_X_SCALE           1000
 #define TRACE_Y_SCALE           1000000
+
+/* Simulated per-slot acquisition time of a multi-channel request. */
+#define ACQ_SIM_MS              2000
+/* Added to the computed procedure bound t sent in the R frame. */
+#define PROC_T_SLACK_S          5
+
+/*
+ * Failure injection for testing X<slot>,ACQ_FAIL handling: the simulated
+ * acquisition of any slot on this channel fails. -1 disables it. Override
+ * at build time, e.g. west build ... -- -DEXTRA_CFLAGS=-DSIM_FAIL_CHANNEL=4
+ */
+#ifndef SIM_FAIL_CHANNEL
+#define SIM_FAIL_CHANNEL        (-1)
+#endif
 
 static char rx_buf[RX_BUF_SIZE];
 static size_t rx_len = 0;
@@ -70,16 +86,39 @@ struct measurement_channel {
 
 static struct measurement_channel current_channel;
 
+/*
+ * Multi-channel procedure state. Unused (multi == false) for legacy
+ * single-channel commands.
+ */
+struct procedure {
+	bool multi;
+	struct multi_request req;
+	uint8_t slot;
+	uint8_t ok;
+	uint8_t failed;
+};
+
+static struct procedure proc;
+
+/* Parsed in the NUS RX callback; copied into proc only when a transfer starts. */
+static struct multi_request pending_req;
+
 enum trace_tx_phase {
 	TRACE_TX_IDLE,
+	TRACE_TX_ACCEPT,     /* multi: R<id>,<n>,<t> */
+	TRACE_TX_ACQUIRE,    /* multi: simulated acquisition of proc.slot finished */
+	TRACE_TX_CHAN_HDR,   /* multi: C<slot>,<channel> */
 	TRACE_TX_BEGIN,
 	TRACE_TX_SCALE,
 	TRACE_TX_DATA,
 	TRACE_TX_END,
+	TRACE_TX_SLOT_FAIL,  /* multi: X<slot>,ACQ_FAIL */
+	TRACE_TX_DONE,       /* multi: D<id>,<ok>,<failed> */
 };
 
 static enum trace_tx_phase trace_phase = TRACE_TX_IDLE;
 static struct k_work_delayable trace_work;
+static uint8_t tx_retries;
 
 /*
  * Signalled from on_disconnected() to wake the main loop for advertising restart.
@@ -141,9 +180,83 @@ static void finish_trace_transfer(void)
 	trace_index = 0;
 	trace_phase = TRACE_TX_IDLE;
 	trace_tx_busy = false;
+	tx_retries = 0;
 	current_channel = (struct measurement_channel){0};
+	proc = (struct procedure){0};
 
 	printk("Trace transfer finished\n");
+}
+
+static void schedule_phase(enum trace_tx_phase phase, k_timeout_t delay)
+{
+	trace_phase = phase;
+	k_work_schedule(&trace_work, delay);
+}
+
+/**
+ * @brief Send one frame of the current phase, retrying on failure.
+ *
+ * On failure (typically -ENOMEM when the BLE TX buffer pool is exhausted),
+ * the same phase is rescheduled with a growing back-off and the frame is
+ * rebuilt and resent. After TRACE_SEND_RETRIES failures the link is dropped,
+ * so the client observes a disconnect instead of silence.
+ *
+ * @return true if the frame was sent and the caller may advance the phase;
+ *         false if the caller must return without changing any state.
+ */
+static bool send_frame(const char *line)
+{
+	int err = send_text_notification(trace_conn, line);
+
+	if (err == 0) {
+		tx_retries = 0;
+		return true;
+	}
+
+	if (tx_retries < TRACE_SEND_RETRIES) {
+		tx_retries++;
+		printk("Send failed (%d), retry %u/%u\n", err, tx_retries, TRACE_SEND_RETRIES);
+		k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS * (tx_retries + 1)));
+		return false;
+	}
+
+	printk("Send failed (%d), giving up and disconnecting\n", err);
+	bt_conn_disconnect(trace_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	finish_trace_transfer();
+	return false;
+}
+
+/*
+ * Upper bound in seconds on the time from R to D, sent as t in the R frame.
+ * Per slot: simulated acquisition plus C, B, S, E and the data frames.
+ */
+static unsigned int procedure_bound_s(uint8_t n)
+{
+	uint32_t per_slot_ms = ACQ_SIM_MS +
+			       (ARRAY_SIZE(trace_data) + 4) * TRACE_SEND_DELAY_MS;
+	uint32_t total_ms = n * per_slot_ms + 2 * TRACE_SEND_DELAY_MS;
+
+	return DIV_ROUND_UP(total_ms, 1000) + PROC_T_SLACK_S;
+}
+
+static bool slot_acquisition_fails(const struct slot_cfg *slot)
+{
+	return (int)slot->channel == SIM_FAIL_CHANNEL;
+}
+
+/* Move to the next slot's acquisition, or to D after the last slot. */
+static void advance_slot(void)
+{
+	proc.slot++;
+	trace_index = 0;
+
+	if (proc.slot < proc.req.n) {
+		printk("Acquiring slot %u (channel %u)\n",
+		       proc.slot, proc.req.slots[proc.slot].channel);
+		schedule_phase(TRACE_TX_ACQUIRE, K_MSEC(ACQ_SIM_MS));
+	} else {
+		schedule_phase(TRACE_TX_DONE, K_MSEC(TRACE_SEND_DELAY_MS));
+	}
 }
 
 /**
@@ -161,6 +274,17 @@ static void finish_trace_transfer(void)
  *   real_voltage_mV = voltage_mv_scaled / x_scale
  *   real_current_nA = current_na_scaled / y_scale
  *
+ * For a multi-channel request the same block is sent once per slot, preceded
+ * by C<slot>,<channel>, and the whole procedure is wrapped in R ... D:
+ *
+ *   R<id>,<n>,<t>
+ *   C<slot>,<channel>  B..E       (or X<slot>,ACQ_FAIL)   -- per slot
+ *   D<id>,<ok>,<failed>
+ *
+ * The dummy firmware "acquires" a slot by waiting ACQ_SIM_MS and streams its
+ * block right after, so it buffers at most one dataset. The contract also
+ * allows deferring blocks; see docs/ble/BLE_CHUNKED_TRACE_PROTOCOL.md.
+ *
  * This work handler runs outside the NUS RX callback. That keeps command
  * reception and longer trace transmission structurally separated.
  */
@@ -168,7 +292,6 @@ static void trace_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	int err;
 	char line[48];
 
 	if (trace_conn == NULL) {
@@ -177,8 +300,39 @@ static void trace_work_handler(struct k_work *work)
 	}
 
 	switch (trace_phase) {
+	case TRACE_TX_ACCEPT:
+		snprintk(line, sizeof(line), "R%u,%u,%u\n",
+			 proc.req.id, proc.req.n, procedure_bound_s(proc.req.n));
+		if (!send_frame(line)) {
+			return;
+		}
+
+		printk("Acquiring slot 0 (channel %u)\n", proc.req.slots[0].channel);
+		schedule_phase(TRACE_TX_ACQUIRE, K_MSEC(ACQ_SIM_MS));
+		break;
+
+	case TRACE_TX_ACQUIRE:
+		if (slot_acquisition_fails(&proc.req.slots[proc.slot])) {
+			schedule_phase(TRACE_TX_SLOT_FAIL, K_NO_WAIT);
+		} else {
+			schedule_phase(TRACE_TX_CHAN_HDR, K_NO_WAIT);
+		}
+		break;
+
+	case TRACE_TX_CHAN_HDR:
+		snprintk(line, sizeof(line), "C%u,%u\n",
+			 proc.slot, proc.req.slots[proc.slot].channel);
+		if (!send_frame(line)) {
+			return;
+		}
+
+		schedule_phase(TRACE_TX_BEGIN, K_MSEC(TRACE_SEND_DELAY_MS));
+		break;
+
 	case TRACE_TX_BEGIN:
-		if (current_channel.present) {
+		if (proc.multi) {
+			printk("Starting trace for slot %u\n", proc.slot);
+		} else if (current_channel.present) {
 			printk("Starting trace on channel %u\n", current_channel.value);
 		} else {
 			printk("Starting trace (no channel specified)\n");
@@ -186,32 +340,22 @@ static void trace_work_handler(struct k_work *work)
 
 		snprintk(line, sizeof(line), "B%u\n",
 			 (unsigned int)ARRAY_SIZE(trace_data));
-
-		err = send_text_notification(trace_conn, line);
-		if (err < 0) {
-			printk("Failed to send trace begin: %d\n", err);
-			finish_trace_transfer();
+		if (!send_frame(line)) {
 			return;
 		}
 
-		trace_phase = TRACE_TX_SCALE;
-		k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS));
+		schedule_phase(TRACE_TX_SCALE, K_MSEC(TRACE_SEND_DELAY_MS));
 		break;
 
 	case TRACE_TX_SCALE:
 		snprintk(line, sizeof(line), "S%d,%d\n",
 			 TRACE_X_SCALE,
 			 TRACE_Y_SCALE);
-
-		err = send_text_notification(trace_conn, line);
-		if (err < 0) {
-			printk("Failed to send scale frame: %d\n", err);
-			finish_trace_transfer();
+		if (!send_frame(line)) {
 			return;
 		}
 
-		trace_phase = TRACE_TX_DATA;
-		k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS));
+		schedule_phase(TRACE_TX_DATA, K_MSEC(TRACE_SEND_DELAY_MS));
 		break;
 
 	case TRACE_TX_DATA:
@@ -223,30 +367,48 @@ static void trace_work_handler(struct k_work *work)
 				 (unsigned int)trace_index,
 				 point->voltage_mv_scaled,
 				 point->current_na_scaled);
-
-			err = send_text_notification(trace_conn, line);
-			if (err < 0) {
-				printk("Failed to send trace point %u: %d\n",
-				       (unsigned int)trace_index, err);
-				finish_trace_transfer();
+			if (!send_frame(line)) {
 				return;
 			}
 
 			trace_index++;
 			k_work_schedule(&trace_work, K_MSEC(TRACE_SEND_DELAY_MS));
 		} else {
-			trace_phase = TRACE_TX_END;
-			k_work_schedule(&trace_work, K_NO_WAIT);
+			schedule_phase(TRACE_TX_END, K_NO_WAIT);
 		}
 		break;
 
 	case TRACE_TX_END:
 		snprintk(line, sizeof(line), "E%u\n",
 			 (unsigned int)ARRAY_SIZE(trace_data));
+		if (!send_frame(line)) {
+			return;
+		}
 
-		err = send_text_notification(trace_conn, line);
-		if (err < 0) {
-			printk("Failed to send trace end: %d\n", err);
+		if (!proc.multi) {
+			finish_trace_transfer();
+			break;
+		}
+
+		proc.ok++;
+		advance_slot();
+		break;
+
+	case TRACE_TX_SLOT_FAIL:
+		snprintk(line, sizeof(line), "X%u,ACQ_FAIL\n", proc.slot);
+		if (!send_frame(line)) {
+			return;
+		}
+
+		proc.failed++;
+		advance_slot();
+		break;
+
+	case TRACE_TX_DONE:
+		snprintk(line, sizeof(line), "D%u,%u,%u\n",
+			 proc.req.id, proc.ok, proc.failed);
+		if (!send_frame(line)) {
+			return;
 		}
 
 		finish_trace_transfer();
@@ -275,12 +437,79 @@ static void start_trace_transfer(struct bt_conn *conn)
 
 	trace_conn = bt_conn_ref(conn);
 	trace_index = 0;
-	trace_phase = TRACE_TX_BEGIN;
 	trace_tx_busy = true;
 
 	printk("Starting trace transfer\n");
 
-	k_work_schedule(&trace_work, K_NO_WAIT);
+	schedule_phase(TRACE_TX_BEGIN, K_NO_WAIT);
+}
+
+/*
+ * Level-3 (hardware capability) validation hook, run on every slot before
+ * the request is accepted. Returns the name of the first field the hardware
+ * cannot honour, or NULL. The dummy firmware has no hardware limits yet.
+ */
+static const char *hw_check_slot(const struct slot_cfg *slot)
+{
+	ARG_UNUSED(slot);
+
+	return NULL;
+}
+
+/**
+ * @brief Validate a multi-channel request and start its procedure.
+ *
+ * Everything is validated before R is sent, so a rejected request never
+ * acquires anything. Rejections are a single terminal frame:
+ *
+ *   ERR=<code>               request-level (BUSY, SYNTAX, SLOT_COUNT)
+ *   V<slot>,<key>,<code>     slot-level (SYNTAX, MISSING, DUP, UNKNOWN, RANGE, HW)
+ */
+static void handle_multi_request(struct bt_conn *conn, const char *cmd)
+{
+	struct request_error_info err;
+	char line[32];
+
+	if (trace_tx_busy) {
+		send_text_notification(conn, "ERR=BUSY\n");
+		return;
+	}
+
+	enum request_error result = parse_multi_request(cmd, &pending_req, &err);
+
+	for (uint8_t i = 0; result == REQUEST_OK && i < pending_req.n; i++) {
+		const char *key = hw_check_slot(&pending_req.slots[i]);
+
+		if (key != NULL) {
+			result = REQUEST_ERR_HW;
+			err = (struct request_error_info){
+				.code = REQUEST_ERR_HW, .slot = i, .key = key,
+			};
+		}
+	}
+
+	if (result == REQUEST_OK) {
+		trace_conn = bt_conn_ref(conn);
+		trace_index = 0;
+		trace_tx_busy = true;
+		proc = (struct procedure){ .multi = true, .req = pending_req };
+
+		printk("Starting multi procedure REQ=%u N=%u\n",
+		       pending_req.id, pending_req.n);
+
+		schedule_phase(TRACE_TX_ACCEPT, K_NO_WAIT);
+		return;
+	}
+
+	if (err.slot < 0) {
+		snprintk(line, sizeof(line), "ERR=%s\n", request_error_str(err.code));
+	} else {
+		snprintk(line, sizeof(line), "V%d,%s,%s\n",
+			 err.slot, err.key, request_error_str(err.code));
+	}
+
+	printk("Rejected multi request\n");
+	send_text_notification(conn, line);
 }
 
 static void notif_enabled(bool enabled, void *ctx)
@@ -333,6 +562,11 @@ static void notif_enabled(bool enabled, void *ctx)
  *
  * - Buffer overflow:
  *     ERR=RX_OVERFLOW
+ *
+ * A command containing a REQ= field is a multi-channel request instead
+ * (REQ=<id>;N=<n>;SLOT=0;CHANNEL=..;START=..;END=..;FREQ=..;RANGE=..;SLOT=1;...),
+ * handled by handle_multi_request(). The fragment/FRAG_OK/'#' handling is
+ * the same for both; fragment boundaries are arbitrary.
  */
 static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
 {
@@ -354,6 +588,13 @@ static void received(struct bt_conn *conn, const void *data, uint16_t len, void 
 			rx_buf[rx_len] = '\0';
 
 			printk("Full command: %s\n", rx_buf);
+
+			if (is_multi_request(rx_buf)) {
+				handle_multi_request(conn, rx_buf);
+				rx_len = 0;
+				command_completed = true;
+				continue;
+			}
 
 			channel_result = parse_channel_field(rx_buf, &channel);
 
