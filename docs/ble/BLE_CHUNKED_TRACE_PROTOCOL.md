@@ -379,7 +379,12 @@ Rules:
   rounded up to seconds, plus 5 s of slack. For example, `t = 19` for N=3.
 - **Failure injection:** build with
   `-- -DEXTRA_CFLAGS=-DSIM_FAIL_CHANNEL=<ch>` to make every slot on channel
-  `<ch>` report `X<slot>,ACQ_FAIL`.
+  `<ch>` report `X<slot>,ACQ_FAIL`. With sysbuild (NCS v3.2.4), the
+  image-prefixed form was verified on 2026-10-09:
+  `west build -b xiao_nrf54l15/nrf54l15/cpuapp -p always -- -Dperipheral_nus_EXTRA_CFLAGS=-DSIM_FAIL_CHANNEL=4`.
+  Check that it applied with
+  `grep -c SIM_FAIL_CHANNEL build/peripheral_nus/compile_commands.json`
+  (non-zero), and rebuild without it afterwards.
 
 ---
 
@@ -486,6 +491,37 @@ S1000,1000000
    - `34,-196,403643` → `-0.196 mV`, `0.403643 nA`
 6. RTT log confirms `result: 0` for all `Notify send:` lines
 
+### Multi-Channel Request (UC8) — Verified On-Target (2026-10-09)
+
+Board: XIAO nRF54L15 (`xiao_nrf54l15/nrf54l15/cpuapp`), NCS v3.2.4, pristine
+builds (`west build -p always`), no RTT viewer attached. Central: macOS
+Bluetooth via `tools/f0_b2_check.py` (bleak), ATT MTU 23. The script writes
+like the app: one TX subscription, every write ≤ 20 bytes, `FRAG_OK` after
+each non-final write, `#` on the last one.
+
+| Scenario | Command | Observed |
+|---|---|---|
+| Legacy command unchanged | `legacy` (`START=-800;END=0;FREQ=100;RANGE=10;CHANNEL=7#`) | `B35`, `S1000,1000000`, 35 points, `E35`; no `C` frame |
+| 3 slots, one field per write (20 writes) | `multi3` | `R42,3,19`, `C0,1` + block, `C1,4` + block, `C2,7` + block, `D42,3,0`; all blocks complete, echoed channels correct |
+| 3 slots, packed 20-byte writes (9 writes) | `multi3 --packed` | same as above |
+| Request ids | `multi3 --repeat 5` | `R`/`D` echo ids 42–46 |
+| Slot rejected | `reject-range` (`FREQ=0` in slot 1) | `V1,FREQ,RANGE` only, nothing after it |
+| Request rejected | `reject-slot-count` (`N=4`, 3 slots) | `ERR=SLOT_COUNT` only, nothing after it |
+| Failure injection (`SIM_FAIL_CHANNEL=4`) | `multi3 --expect-fail 1` | `C0,1` + block, `X1,ACQ_FAIL`, `C2,7` + block, `D42,2,1` |
+| Disconnect during slot 1 acquisition (between blocks) | `multi3 --wait 60`, link lost at 5.0 s | slot 0 complete; no further frames; board advertises again |
+| Disconnect inside slot 0's block | `multi3 --wait 60 --disconnect-in-block 0` (central drops the link after point 2) | slot 0 incomplete; board advertises again |
+
+Timing (macOS central; a phone may differ):
+
+- Final write → `R`: 36–134 ms over 10 runs (median ≈ 90 ms).
+- `R` promises `t = 19` s for N=3; `D` arrived after ≈ 13.0 s (≈ 10.7 s with
+  one `ACQ_FAIL` slot).
+- Each block arrives ≈ 2 s after the previous one ends (`ACQ_SIM_MS`); a
+  35-point block takes ≈ 2.3 s from `B35` to `E35`.
+
+For comparison, the app (UC8 plan 3) waits 3 s for `R` and uses a deadline
+of `t + 10 s` after `R`.
+
 ### Channel Field — Not Yet Verified On-Target
 
 The `CHANNEL` field is covered by the host-compiled unit tests in
@@ -513,7 +549,9 @@ write START=-800;END=0;FREQ=100;RANGE=10;CHANNEL=7#
 - only one trace transfer (legacy or multi) is supported at a time
 - multi-channel requests: parameters are validated but not applied; every
   slot returns the same hard-coded trace after a simulated acquisition delay
-- multi-channel requests are host-unit-tested but not yet verified on-target
+- multi-channel requests are host-unit-tested and verified on-target with
+  the dummy acquisition (see "Verified Test Scenario"), not with real
+  electrodes
 - # is used as command terminator for manual testing
 - no checksum yet
 - no protocol version frame yet

@@ -121,9 +121,9 @@ Requirements
 Building and Running
 ********************
 
-Build for the XIAO nRF54L15::
+Build for the XIAO nRF54L15 (NCS v3.2.4 needs the full board target)::
 
-    west build -b xiao_nrf54l15
+    west build -b xiao_nrf54l15/nrf54l15/cpuapp
 
 Flash::
 
@@ -148,6 +148,15 @@ Testing with nRF Connect
 
 5. Observe ``FRAG_OK`` after each non-final write, then the full trace
    notification sequence.
+
+Testing the multi-channel request (UC8)
+=======================================
+
+``tools/f0_b2_check.py`` sends legacy and multi-channel requests from a Mac
+and validates the response (see its docstring for all scenarios)::
+
+    python3 -m venv .venv && .venv/bin/pip install bleak
+    .venv/bin/python3 tools/f0_b2_check.py multi3
 
 Current Limitations
 *******************
